@@ -1,0 +1,5 @@
+{
+  "name": "Writing Monitoring System",
+  "description": "An objective, system-driven writing monitor for educational and exam scenarios that records writing time and sessions based on strict visibility and environment conditions.",
+  "requestFramePermissions": []
+}
