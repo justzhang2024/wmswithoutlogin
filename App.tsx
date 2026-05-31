@@ -1,16 +1,11 @@
-
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { initializeApp, getApp, getApps } from 'firebase/app';
-import type { FirebaseApp } from 'firebase/app';
-import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from 'firebase/auth';
-import type { User, Auth } from 'firebase/auth';
-import { getDatabase, ref, onValue, set, onDisconnect, get, remove } from 'firebase/database';
-import type { DatabaseReference, DataSnapshot, Database } from 'firebase/database';
+import { createClient } from '@supabase/supabase-js';
 import { WritingState, AppView, StudentStatus, TeacherRoom, StudentInfo } from './types';
 import { formatDuration, countWords, formatTimestamp } from './utils/monitoring';
 import { motion, AnimatePresence } from 'framer-motion';
 
 declare const jspdf: any;
+declare const process: any;
 
 const getEnv = (key: string): string => {
   try {
@@ -26,33 +21,11 @@ const getEnv = (key: string): string => {
   return "";
 };
 
-const firebaseConfig = {
-  apiKey: getEnv('VITE_FIREBASE_API_KEY'),
-  authDomain: getEnv('VITE_FIREBASE_AUTH_DOMAIN'),
-  databaseURL: getEnv('VITE_FIREBASE_DATABASE_URL'),
-  projectId: getEnv('VITE_FIREBASE_PROJECT_ID'),
-  storageBucket: getEnv('VITE_FIREBASE_STORAGE_BUCKET'),
-  messagingSenderId: getEnv('VITE_FIREBASE_MESSAGING_SENDER_ID'),
-  appId: getEnv('VITE_FIREBASE_APP_ID')
-};
+const supabaseUrl = getEnv('VITE_SUPABASE_URL');
+const supabaseAnonKey = getEnv('VITE_SUPABASE_ANON_KEY');
+const isConfigValid = !!(supabaseUrl && supabaseAnonKey);
 
-let app: FirebaseApp | null = null;
-let db: Database | null = null;
-let auth: Auth | null = null;
-
-const isConfigValid = !!(firebaseConfig.apiKey && firebaseConfig.databaseURL);
-
-if (isConfigValid) {
-  try {
-    app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
-    if (app) {
-      db = getDatabase(app);
-      auth = getAuth(app);
-    }
-  } catch (error) {
-    console.error("Firebase Initialization Error:", error);
-  }
-}
+const supabase = isConfigValid ? createClient(supabaseUrl, supabaseAnonKey) : null;
 
 const CustomDialog: React.FC<{
   isOpen: boolean;
@@ -84,20 +57,20 @@ const CustomDialog: React.FC<{
 };
 
 const App: React.FC = () => {
-  const [view, setView] = useState<AppView>('HOME');
-  const [user, setUser] = useState<User | null>(null);
-  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [view, setView] = useState<AppView>('LOGIN');
+  const [isSystemUnlocked, setIsSystemUnlocked] = useState(false);
+  const [systemPassword, setSystemPassword] = useState('');
   const [isFocused, setIsFocused] = useState(document.hasFocus());
-  const [syncStatus, setSyncStatus] = useState<'CONNECTED' | 'OFFLINE' | 'CONFIG_REQUIRED'>(isConfigValid ? 'OFFLINE' : 'CONFIG_REQUIRED');
+  const [syncStatus, setSyncStatus] = useState<'CONNECTED' | 'OFFLINE' | 'CONFIG_REQUIRED'>(isConfigValid ? 'CONNECTED' : 'CONFIG_REQUIRED');
   const [lockType, setLockType] = useState<'SUBMISSION' | 'VIOLATION' | 'MANUAL' | null>(null);
   
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
   const [edgeGlow, setEdgeGlow] = useState({ top: false, bottom: false, left: false, right: false });
   const [isMoving, setIsMoving] = useState(false);
-  const leaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const idleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const leaveTimeoutRef = useRef<any>(null);
+  const idleTimeoutRef = useRef<any>(null);
   const sessionStartTimeRef = useRef<number>(0);
-  const padViolationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const padViolationTimeoutRef = useRef<any>(null);
 
   const [activeRoom, setActiveRoom] = useState<TeacherRoom | null>(null);
   const [state, setState] = useState<WritingState>({ 
@@ -118,23 +91,56 @@ const App: React.FC = () => {
     isOpen: false, message: '', type: 'alert', onConfirm: () => {}
   });
 
-  const studentRef = useRef<DatabaseReference | null>(null);
-  const roomRef = useRef<DatabaseReference | null>(null);
-  const roomMonitorRef = useRef<DatabaseReference | null>(null);
+  const studentChannelRef = useRef<any>(null);
+  const teacherChannelRef = useRef<any>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const contentRef = useRef(state.content);
   const wordCountRef = useRef(state.wordCount);
+
+  const [dashboardTicker, setDashboardTicker] = useState(Date.now());
 
   useEffect(() => {
     contentRef.current = state.content;
     wordCountRef.current = state.wordCount;
   }, [state.content, state.wordCount]);
 
+  // Check sessionStorage on mount for system password bypass
+  useEffect(() => {
+    const unlocked = sessionStorage.getItem('wms_system_unlocked') === 'true';
+    if (unlocked) {
+      setIsSystemUnlocked(true);
+      setView('HOME');
+    } else {
+      setView('LOGIN');
+    }
+  }, []);
+
   const safeFirebaseKey = (str: string) => 
     str.replace(/\s+/g, '').toLowerCase().replace(/[.#$[\]/]/g, "_");
 
   const cleanRoomCode = (code: string) => safeFirebaseKey(code);
   const cleanStudentName = (name: string) => safeFirebaseKey(name);
+
+  /**
+   * Helper to check student offline state dynamically on Teacher Dashboard
+   */
+  const isStudentOffline = useCallback((student: StudentInfo) => {
+    if (student.status === StudentStatus.SUBMITTED || student.status === StudentStatus.VIOLATION) {
+      return false;
+    }
+    return Date.now() - student.lastSeen > 15000;
+  }, []);
+
+  /**
+   * Teacher Dashboard dynamic offline evaluation ticker
+   */
+  useEffect(() => {
+    if (view !== 'TEACHER_DASHBOARD') return;
+    const interval = setInterval(() => {
+      setDashboardTicker(Date.now());
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [view]);
 
   /**
    * Enhanced PDF download with multi-page support
@@ -173,10 +179,9 @@ const App: React.FC = () => {
       let cursorY = 62;
 
       splitContent.forEach((line: string) => {
-        // Check if we need a new page
         if (cursorY + lineHeight > pageHeight - bottomMargin) {
           doc.addPage();
-          cursorY = 20; // Reset Y for new page
+          cursorY = 20; 
         }
         doc.text(line, margin, cursorY);
         cursorY += lineHeight;
@@ -189,25 +194,40 @@ const App: React.FC = () => {
     }
   }, [state.content, state.examInfo, state.wordCount]);
 
-  const updateRealtimeStatus = useCallback((status: StudentStatus, reason?: string) => {
-    if (studentRef.current && state.examInfo && syncStatus === 'CONNECTED') {
-      const updateData: any = {
-        name: state.examInfo.name,
-        title: state.examInfo.title,
-        wordCount: wordCountRef.current,
-        status: status,
-        lastSeen: Date.now()
-      };
-      if (reason) updateData.lockReason = reason;
+  /**
+   * Update student status, word count, draft content, and last seen inside Supabase
+   */
+  const updateRealtimeStatus = useCallback(async (status: StudentStatus, reason?: string) => {
+    if (supabase && state.examInfo && syncStatus === 'CONNECTED') {
+      const cleanedCode = cleanRoomCode(state.examInfo.roomCode);
+      const cleanedName = cleanStudentName(state.examInfo.name);
       
-      set(studentRef.current, updateData).catch(e => console.error("Sync Failed:", e));
+      const updateData: any = {
+        word_count: wordCountRef.current,
+        content: contentRef.current,
+        status: status,
+        last_seen: new Date().toISOString()
+      };
+      if (reason) updateData.lock_reason = reason;
+      
+      const { error } = await supabase
+        .from('students')
+        .update(updateData)
+        .eq('room_code', cleanedCode)
+        .eq('student_key', cleanedName);
+
+      if (error) {
+        console.error("Supabase Sync Failed:", error);
+      }
     }
   }, [state.examInfo, syncStatus]);
 
+  /**
+   * Lockdown handler
+   */
   const handleLockdown = useCallback((type: 'SUBMISSION' | 'VIOLATION' | 'MANUAL', message: string) => {
     if (view === 'LOCKED') return; 
     
-    // Persistence: Save draft before lockdown
     localStorage.setItem('writing_exam_draft', contentRef.current);
 
     setLockType(type);
@@ -215,7 +235,6 @@ const App: React.FC = () => {
     
     const status = type === 'VIOLATION' ? StudentStatus.VIOLATION : StudentStatus.SUBMITTED;
     
-    // Extract a short reason from the message
     let shortReason = "";
     if (type === 'VIOLATION') {
       if (message.includes("Window focus")) shortReason = "Focus Lost";
@@ -251,56 +270,116 @@ const App: React.FC = () => {
     });
   }, [view, updateRealtimeStatus]);
 
-  const joinRoomAsStudent = useCallback((roomCode: string, studentName: string) => {
-    if (!db) return;
-    const code = cleanRoomCode(roomCode);
-    const cleanName = cleanStudentName(studentName);
-    
-    studentRef.current = ref(db, `rooms/${code}/students/${cleanName}`);
-    roomMonitorRef.current = ref(db, `rooms/${code}`);
+  /**
+   * Subscribe to student's database updates (for room termination and teacher unlocks)
+   */
+  const subscribeToStudentRow = useCallback((roomCode: string, studentName: string) => {
+    if (!supabase) return;
+    const cleanedCode = cleanRoomCode(roomCode);
+    const cleanedName = cleanStudentName(studentName);
 
-    onDisconnect(studentRef.current).update({ status: StudentStatus.OFFLINE, lastSeen: Date.now() });
+    if (studentChannelRef.current) {
+      supabase.removeChannel(studentChannelRef.current);
+    }
 
-    onValue(roomMonitorRef.current, (snapshot: DataSnapshot) => {
-      if (!snapshot.exists()) {
-        setState(prev => {
-          if (prev.isRecording) {
-            handleLockdown('MANUAL', "The teacher has ended the session. Your work has been automatically saved and downloaded.");
+    studentChannelRef.current = supabase
+      .channel(`student-track:${cleanedName}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'students',
+        filter: `room_code=eq.${cleanedCode}`
+      }, (payload) => {
+        const { eventType, new: newRow, old: oldRow } = payload;
+        
+        if (eventType === 'DELETE' && oldRow.student_key === cleanedName) {
+          // Room/Student was deleted (Teacher ended session)
+          setState(prev => {
+            if (prev.isRecording) {
+              handleLockdown('MANUAL', "The teacher has ended the session. Your work has been automatically saved and downloaded.");
+            }
+            return prev;
+          });
+        } else if (eventType === 'UPDATE' && newRow.student_key === cleanedName) {
+          // If status changes to OFFLINE (Teacher clicked Reset Access), unlock student instantly
+          if (newRow.status === StudentStatus.OFFLINE) {
+            setView('STUDENT_EXAM');
+            setLockType(null);
+            setState(prev => ({
+              ...prev,
+              content: newRow.content || '',
+              wordCount: countWords(newRow.content || ''),
+              isRecording: true
+            }));
           }
-          return prev;
-        });
-      }
-    });
-
-    setSyncStatus('CONNECTED');
+        }
+      })
+      .subscribe();
   }, [handleLockdown]);
 
+  /**
+   * Student cleanup on unmount/disconnect
+   */
+  const handleStudentOfflineOnExit = async () => {
+    if (supabase && state.examInfo) {
+      const cleanedCode = cleanRoomCode(state.examInfo.roomCode);
+      const cleanedName = cleanStudentName(state.examInfo.name);
+      await supabase
+        .from('students')
+        .update({ status: StudentStatus.OFFLINE, last_seen: new Date().toISOString() })
+        .eq('room_code', cleanedCode)
+        .eq('student_key', cleanedName);
+    }
+  };
+
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      handleStudentOfflineOnExit();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [state.examInfo]);
+
+  /**
+   * Reset student access (Teacher action)
+   */
   const resetStudentStatus = async (studentKey: string) => {
-    if (!db || !activeRoom) return;
+    if (!supabase || !activeRoom) return;
     const code = cleanRoomCode(activeRoom.roomCode);
-    const sRef = ref(db, `rooms/${code}/students/${studentKey}`);
+    const cleanKey = cleanStudentName(studentKey);
     try {
-      const snapshot = await get(sRef);
-      if (snapshot.exists()) {
-        const val = snapshot.val() as StudentInfo;
-        await set(sRef, {
-          ...val,
+      await supabase
+        .from('students')
+        .update({
           status: StudentStatus.OFFLINE,
-          lastSeen: Date.now(),
-          lockReason: null
-        });
-      }
+          last_seen: new Date().toISOString(),
+          lock_reason: null
+        })
+        .eq('room_code', code)
+        .eq('student_key', cleanKey);
     } catch (e) {
       console.error("Failed to reset student:", e);
     }
   };
 
+  /**
+   * End session and terminate room (Teacher action)
+   */
   const stopExam = useCallback(async () => {
-    if (!db || !activeRoom) return;
+    if (!supabase || !activeRoom) return;
     const code = cleanRoomCode(activeRoom.roomCode);
-    const roomPath = ref(db, `rooms/${code}`);
     try {
-      await remove(roomPath);
+      // Deleting the room will automatically delete all student sessions cascadingly in postgres
+      await supabase
+        .from('rooms')
+        .delete()
+        .eq('room_code', code);
+
+      if (teacherChannelRef.current) {
+        supabase.removeChannel(teacherChannelRef.current);
+      }
       setActiveRoom(null);
       setView('HOME');
     } catch (e) {
@@ -321,14 +400,22 @@ const App: React.FC = () => {
     });
   };
 
+  /**
+   * Teacher joins room and monitors in real-time
+   */
   const joinRoomAsTeacher = async (roomCode: string) => {
-    if (!db || !roomCode) return;
+    if (!supabase || !roomCode) return;
     const code = cleanRoomCode(roomCode);
-    const roomRefCheck = ref(db, `rooms/${code}`);
     
     try {
-      const snapshot = await get(roomRefCheck);
-      if (snapshot.exists()) {
+      // Check if room exists
+      const { data: existingRoom, error: checkError } = await supabase
+        .from('rooms')
+        .select('*')
+        .eq('room_code', code)
+        .maybeSingle();
+
+      if (existingRoom) {
         setDialog({
           isOpen: true,
           message: 'This room code is already active. Please use a unique code.',
@@ -338,18 +425,77 @@ const App: React.FC = () => {
         return;
       }
 
-      await set(roomRefCheck, { createdAt: Date.now() });
-      onDisconnect(roomRefCheck).remove();
-      
-      roomRef.current = ref(db, `rooms/${code}/students`);
-      onValue(roomRef.current, (snapshot: DataSnapshot) => {
-        const students = (snapshot.val() as Record<string, StudentInfo>) || {};
-        setActiveRoom({
-          roomCode: roomCode.toUpperCase(), 
-          createdAt: Date.now(),
-          students: students
+      // Create new room
+      const { error: roomError } = await supabase
+        .from('rooms')
+        .insert({ room_code: code });
+
+      if (roomError) {
+        console.error("Room launch failed:", roomError);
+        return;
+      }
+
+      // Fetch initial students
+      const { data: initialStudents } = await supabase
+        .from('students')
+        .select('*')
+        .eq('room_code', code);
+
+      const studentsMap: Record<string, StudentInfo> = {};
+      if (initialStudents) {
+        initialStudents.forEach(s => {
+          studentsMap[s.student_key] = {
+            name: s.name,
+            title: s.title,
+            wordCount: s.word_count,
+            status: s.status as StudentStatus,
+            lastSeen: new Date(s.last_seen).getTime(),
+            lockReason: s.lock_reason
+          };
         });
+      }
+
+      setActiveRoom({
+        roomCode: roomCode.toUpperCase(), 
+        createdAt: Date.now(),
+        students: studentsMap
       });
+
+      // Subscribe to student changes for this room
+      if (teacherChannelRef.current) {
+        supabase.removeChannel(teacherChannelRef.current);
+      }
+
+      teacherChannelRef.current = supabase
+        .channel(`room-monitor:${code}`)
+        .on('postgres_changes', {
+          event: '*',
+          schema: 'public',
+          table: 'students',
+          filter: `room_code=eq.${code}`
+        }, (payload) => {
+          const { eventType, new: newRow, old: oldRow } = payload;
+          
+          setActiveRoom(prev => {
+            if (!prev) return null;
+            const updatedStudents = { ...prev.students };
+            if (eventType === 'DELETE') {
+              delete updatedStudents[oldRow.student_key];
+            } else {
+              updatedStudents[newRow.student_key] = {
+                name: newRow.name,
+                title: newRow.title,
+                wordCount: newRow.word_count,
+                status: newRow.status as StudentStatus,
+                lastSeen: new Date(newRow.last_seen).getTime(),
+                lockReason: newRow.lock_reason
+              };
+            }
+            return { ...prev, students: updatedStudents };
+          });
+        })
+        .subscribe();
+      
       setSyncStatus('CONNECTED');
       setView('TEACHER_DASHBOARD');
     } catch (error) {
@@ -357,55 +503,35 @@ const App: React.FC = () => {
     }
   };
 
-  useEffect(() => {
-    if (!auth) return;
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setIsAuthLoading(false);
-      if (currentUser) {
-        if (!currentUser.email?.endsWith('@nis.ac.th')) {
-          signOut(auth!).then(() => {
-            setDialog({
-              isOpen: true,
-              message: 'Access Denied: Please use your @nis.ac.th account to login.',
-              type: 'alert',
-              onConfirm: () => setDialog(d => ({ ...d, isOpen: false }))
-            });
-          });
-        } else {
-          setExamEntry(prev => ({ ...prev, name: currentUser.email || '' }));
-        }
-      }
-    });
-    return () => unsubscribe();
-  }, []);
-
-  const handleLogin = async () => {
-    if (!auth) return;
-    const provider = new GoogleAuthProvider();
-    provider.setCustomParameters({ hd: 'nis.ac.th' });
-    try {
-      await signInWithPopup(auth, provider);
-    } catch (error) {
-      console.error("Login Error:", error);
-    }
-  };
-
-  const handleLogout = async () => {
-    if (!auth) return;
-    await signOut(auth);
-    setView('HOME');
-  };
-
-  useEffect(() => {
-    if (isAuthLoading) return;
-    if (!user && view !== 'LOGIN') {
-      setView('LOGIN');
-    } else if (user && view === 'LOGIN') {
+  /**
+   * System Gateway password check
+   */
+  const handleSystemPasswordGate = () => {
+    const correctPassword = getEnv('VITE_SYSTEM_PASSWORD') || 'niswms2026';
+    if (systemPassword === correctPassword) {
+      sessionStorage.setItem('wms_system_unlocked', 'true');
+      setIsSystemUnlocked(true);
       setView('HOME');
+    } else {
+      setDialog({
+        isOpen: true,
+        message: 'Invalid access code. Please check with your supervisor.',
+        type: 'alert',
+        onConfirm: () => setDialog(d => ({ ...d, isOpen: false }))
+      });
     }
-  }, [user, isAuthLoading, view]);
+  };
 
+  const handleLogout = () => {
+    sessionStorage.removeItem('wms_system_unlocked');
+    setIsSystemUnlocked(false);
+    setSystemPassword('');
+    setView('LOGIN');
+  };
+
+  /**
+   * Timer ticking
+   */
   useEffect(() => {
     if (state.isRecording) {
       sessionStartTimeRef.current = Date.now();
@@ -424,19 +550,35 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, [state.isRecording, isFocused]);
 
+  /**
+   * Student focus dynamic sync updates
+   */
   useEffect(() => {
     if (view === 'STUDENT_EXAM' && syncStatus === 'CONNECTED' && state.isRecording) {
       const status = isFocused ? StudentStatus.ACTIVE : StudentStatus.PAUSED;
       updateRealtimeStatus(status);
     }
-  }, [state.wordCount, isFocused, view, syncStatus, updateRealtimeStatus, state.isRecording]);
+  }, [isFocused, view, syncStatus, updateRealtimeStatus, state.isRecording]);
 
+  /**
+   * Periodic auto-save & heartbeat to Supabase database (every 5 seconds)
+   */
+  useEffect(() => {
+    if (!state.isRecording || view !== 'STUDENT_EXAM' || syncStatus !== 'CONNECTED') return;
+    const heartbeatTimer = setInterval(() => {
+      const status = isFocused ? StudentStatus.ACTIVE : StudentStatus.PAUSED;
+      updateRealtimeStatus(status);
+    }, 5000);
+    return () => clearInterval(heartbeatTimer);
+  }, [state.isRecording, view, syncStatus, isFocused, updateRealtimeStatus]);
+
+  /**
+   * Tablet/Pad optimization & focus monitoring
+   */
   useEffect(() => {
     if (view !== 'STUDENT_EXAM' || !state.isRecording) return;
 
     if (state.isPad) {
-      // In Pad mode, we use a 0.1s delay to ensure both focus and visibility states are updated.
-      // This avoids race conditions where one event fires slightly before the other.
       if (!isFocused || document.visibilityState === 'hidden') {
         if (!padViolationTimeoutRef.current) {
           padViolationTimeoutRef.current = setTimeout(() => {
@@ -466,6 +608,9 @@ const App: React.FC = () => {
     };
   }, [isFocused, view, state.isRecording, state.isPad, handleLockdown]);
 
+  /**
+   * Core Anti-Cheating Event Listeners
+   */
   useEffect(() => {
     if (view === 'STUDENT_EXAM' && state.isRecording) {
       const isGracePeriod = () => {
@@ -503,7 +648,6 @@ const App: React.FC = () => {
           e.preventDefault();
           handleLockdown('VIOLATION', "Security Violation: Escape key detected. Session locked and work downloaded.");
         }
-        // Mac Command Key
         if (e.metaKey) {
           e.preventDefault();
           handleLockdown('VIOLATION', "Security Violation: Command key detected. Session locked and work downloaded.");
@@ -514,21 +658,18 @@ const App: React.FC = () => {
         }
       };
 
-        const handleFullscreenChange = () => {
-          // Pad mode does not enforce fullscreen strictly after entry
-          if (state.isPad) return;
-
-          const check = () => {
-            if (!document.fullscreenElement && view === 'STUDENT_EXAM' && state.isRecording) {
-              handleLockdown('VIOLATION', "Security Violation: Fullscreen mode exited. Session locked and work downloaded.");
-            }
-          };
-          check();
+      const handleFullscreenChange = () => {
+        if (state.isPad) return;
+        const check = () => {
+          if (!document.fullscreenElement && view === 'STUDENT_EXAM' && state.isRecording) {
+            handleLockdown('VIOLATION', "Security Violation: Fullscreen mode exited. Session locked and work downloaded.");
+          }
         };
+        check();
+      };
 
       const handleMouseLeave = (e: MouseEvent) => {
         if (state.isPad) return;
-        // Buffer Zone: Only trigger if it's actually leaving the window/document
         if (!e.relatedTarget && !((e as any).toElement)) {
           if (leaveTimeoutRef.current) clearTimeout(leaveTimeoutRef.current);
           leaveTimeoutRef.current = setTimeout(() => {
@@ -549,7 +690,6 @@ const App: React.FC = () => {
         if (!state.isRecording) return;
         if (state.isPad) return;
         
-        // Buffer Zone: Clear leave timeout if mouse is back
         if (leaveTimeoutRef.current) {
           clearTimeout(leaveTimeoutRef.current);
           leaveTimeoutRef.current = null;
@@ -557,7 +697,6 @@ const App: React.FC = () => {
 
         setMousePos({ x: e.clientX, y: e.clientY });
         
-        // Visual Guide: Edge detection (50px)
         const margin = 50;
         setEdgeGlow({
           top: e.clientY < margin,
@@ -566,7 +705,6 @@ const App: React.FC = () => {
           right: e.clientX > window.innerWidth - margin
         });
 
-        // Continuous Pulse: Movement detection
         setIsMoving(true);
         if (idleTimeoutRef.current) clearTimeout(idleTimeoutRef.current);
         idleTimeoutRef.current = setTimeout(() => {
@@ -579,13 +717,11 @@ const App: React.FC = () => {
         if (!state.isRecording) return;
         const currentHeight = window.innerHeight;
 
-        // Pad Mode: Detect keyboard dismissal (height increase)
         if (state.isPad) {
           lastHeight = currentHeight;
           return;
         }
 
-        // Desktop Mode: Fullscreen and height reduction detection
         if (document.fullscreenElement && currentHeight > lastHeight) {
           lastHeight = currentHeight;
           return;
@@ -653,6 +789,9 @@ const App: React.FC = () => {
     };
   }, []);
 
+  /**
+   * Start Exam Flow
+   */
   const startExam = async () => {
     if (!examEntry.name || !examEntry.code || !examEntry.title) {
       setDialog({ 
@@ -667,13 +806,17 @@ const App: React.FC = () => {
     const cleanedCode = cleanRoomCode(examEntry.code);
     const cleanedName = cleanStudentName(examEntry.name);
     
-    if (!db) return;
-    const roomPath = `rooms/${cleanedCode}`;
-    const studentPath = `${roomPath}/students/${cleanedName}`;
+    if (!supabase) return;
 
     try {
-      const roomSnapshot = await get(ref(db, roomPath));
-      if (!roomSnapshot.exists()) {
+      // 1. Verify Room Exists
+      const { data: roomSnapshot, error: roomError } = await supabase
+        .from('rooms')
+        .select('*')
+        .eq('room_code', cleanedCode)
+        .maybeSingle();
+
+      if (!roomSnapshot) {
         setDialog({
           isOpen: true,
           message: 'Room not found. Please wait for the teacher to start the session.',
@@ -683,10 +826,16 @@ const App: React.FC = () => {
         return;
       }
 
-      const studentSnapshot = await get(ref(db, studentPath));
-      if (studentSnapshot.exists()) {
-        const studentData = studentSnapshot.val() as StudentInfo;
-        const status = studentData.status;
+      // 2. Verify Student Status
+      const { data: studentSnapshot, error: studentError } = await supabase
+        .from('students')
+        .select('*')
+        .eq('room_code', cleanedCode)
+        .eq('student_key', cleanedName)
+        .maybeSingle();
+
+      if (studentSnapshot) {
+        const status = studentSnapshot.status as StudentStatus;
 
         if (status === StudentStatus.SUBMITTED) {
           setDialog({
@@ -709,34 +858,58 @@ const App: React.FC = () => {
         }
 
         if (status === StudentStatus.ACTIVE || status === StudentStatus.PAUSED) {
-          setDialog({
-            isOpen: true,
-            message: 'Access Denied: This identity is currently active in another session.',
-            type: 'alert',
-            onConfirm: () => setDialog(d => ({ ...d, isOpen: false }))
-          });
-          return;
+          // If the student heartbeat shows they are active, block duplicate joins!
+          const lastSeenDiff = Date.now() - new Date(studentSnapshot.last_seen).getTime();
+          if (lastSeenDiff < 15000) {
+            setDialog({
+              isOpen: true,
+              message: 'Access Denied: This student name is already active or joined in this room. Please use a different name or ask your teacher to reset access.',
+              type: 'alert',
+              onConfirm: () => setDialog(d => ({ ...d, isOpen: false }))
+            });
+            return;
+          }
         }
 
+        // If status is OFFLINE, allow resuming work
         setDialog({
           isOpen: true,
           message: 'Previous session detected. Resuming work...',
           type: 'alert',
           onConfirm: () => {
             setDialog(d => ({...d, isOpen: false}));
-            executeJoin();
+            executeJoin(studentSnapshot.content || '');
           }
         });
         return;
       }
 
-      executeJoin();
+      // 3. Insert Brand New Student Session
+      const { error: insertError } = await supabase
+        .from('students')
+        .insert({
+          room_code: cleanedCode,
+          name: examEntry.name,
+          student_key: cleanedName,
+          title: examEntry.title,
+          word_count: 0,
+          content: '',
+          status: StudentStatus.ACTIVE,
+          last_seen: new Date().toISOString()
+        });
+
+      if (insertError) {
+        console.error("Failed to register student:", insertError);
+        return;
+      }
+
+      executeJoin('');
     } catch (error) {
       console.error("Validation Error:", error);
     }
 
-    function executeJoin() {
-      const draft = localStorage.getItem('writing_exam_draft');
+    function executeJoin(draftContent: string) {
+      const draft = draftContent || localStorage.getItem('writing_exam_draft');
       sessionStartTimeRef.current = Date.now();
       setIsFocused(true);
       setState(prev => ({
@@ -748,10 +921,18 @@ const App: React.FC = () => {
         isPad: isPadEntry,
         examInfo: { name: examEntry.name, roomCode: examEntry.code, title: examEntry.title }
       }));
-      joinRoomAsStudent(examEntry.code, examEntry.name);
+      
+      subscribeToStudentRow(examEntry.code, examEntry.name);
+      
+      // Mark as ACTIVE inside DB
+      supabase?.from('students')
+        .update({ status: StudentStatus.ACTIVE, last_seen: new Date().toISOString() })
+        .eq('room_code', cleanedCode)
+        .eq('student_key', cleanedName)
+        .then();
+
       setView('STUDENT_EXAM');
       
-      // Request Fullscreen (Skip for Pad mode)
       if (!isPadEntry && document.documentElement.requestFullscreen) {
         document.documentElement.requestFullscreen().catch(e => {
           console.error("Fullscreen request failed:", e);
@@ -782,14 +963,13 @@ const App: React.FC = () => {
 
   const dashboardStats = useMemo(() => {
     if (!activeRoom) return { online: 0, manual: 0, passive: 0 };
-    // Fix: Explicitly cast Object.values result to resolve unknown type issues
     const students = Object.values(activeRoom.students) as StudentInfo[];
     return {
-      online: students.filter(s => s.status === StudentStatus.ACTIVE || s.status === StudentStatus.PAUSED).length,
+      online: students.filter(s => !isStudentOffline(s) && (s.status === StudentStatus.ACTIVE || s.status === StudentStatus.PAUSED)).length,
       manual: students.filter(s => s.status === StudentStatus.SUBMITTED).length,
-      passive: students.filter(s => s.status === StudentStatus.VIOLATION).length
+      passive: students.filter(s => isStudentOffline(s) || s.status === StudentStatus.VIOLATION).length
     };
-  }, [activeRoom]);
+  }, [activeRoom, isStudentOffline, dashboardTicker]);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-700 p-4 md:p-8">
@@ -800,10 +980,10 @@ const App: React.FC = () => {
             <p className="text-slate-500 font-medium text-sm">Professional Exam Monitor & Document Archiver</p>
           </div>
           <div className="flex items-center gap-4">
-            {user && (
+            {isSystemUnlocked && (
               <div className="flex items-center gap-3 bg-white px-4 py-2 rounded-2xl border border-slate-200 shadow-sm">
-                <span className="text-xs font-bold text-slate-600">{user.email}</span>
-                <button onClick={handleLogout} className="text-[10px] font-black text-rose-500 uppercase tracking-widest hover:text-rose-700">Logout</button>
+                <span className="text-xs font-bold text-slate-600">Authorized Session</span>
+                <button onClick={handleLogout} className="text-[10px] font-black text-rose-500 uppercase tracking-widest hover:text-rose-700">Lock</button>
               </div>
             )}
             <div className={`px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all ${
@@ -824,20 +1004,24 @@ const App: React.FC = () => {
                 </svg>
               </div>
               <div>
-                <h2 className="text-3xl font-black text-slate-900 mb-2">Welcome WMS</h2>
-                <p className="text-slate-400 font-medium">Please sign in with your <span className="text-indigo-600 font-bold">nis.ac.th</span> account to continue.</p>
+                <h2 className="text-3xl font-black text-slate-900 mb-2">System Gate</h2>
+                <p className="text-slate-400 font-medium">Please enter the platform assigned access password to proceed.</p>
+              </div>
+              <div className="space-y-4">
+                <input 
+                  type="password" 
+                  placeholder="Access Password" 
+                  className="w-full p-4 bg-slate-50 rounded-xl border-2 border-transparent focus:border-indigo-500 outline-none transition-all text-center font-bold text-lg" 
+                  value={systemPassword} 
+                  onChange={e => setSystemPassword(e.target.value)} 
+                  onKeyDown={e => e.key === 'Enter' && handleSystemPasswordGate()}
+                />
               </div>
               <button 
-                onClick={handleLogin}
-                className="w-full flex items-center justify-center gap-3 py-5 bg-slate-900 text-white rounded-2xl font-black hover:bg-black transition-all shadow-xl active:scale-95"
+                onClick={handleSystemPasswordGate}
+                className="w-full flex items-center justify-center gap-3 py-5 bg-indigo-600 text-white rounded-2xl font-black hover:bg-indigo-700 transition-all shadow-xl active:scale-95"
               >
-                <svg className="w-5 h-5" viewBox="0 0 24 24">
-                  <path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
-                  <path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-                  <path fill="currentColor" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z" />
-                  <path fill="currentColor" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
-                </svg>
-                Sign in with Google
+                Access System
               </button>
             </div>
           </div>
@@ -913,16 +1097,17 @@ const App: React.FC = () => {
         {view === 'STUDENT_EXAM_ENTRY' && (
           <div className="max-w-md mx-auto bg-white p-8 md:p-12 rounded-[3rem] shadow-2xl border border-slate-100 space-y-8 animate-in fade-in">
             <div>
-              <h3 className="text-2xl font-black mb-1">Session Login {isPadEntry && <span className="text-indigo-600 text-sm ml-2">(Pad Mode)</span>}</h3>
+              <h3 className="text-2xl font-black mb-1">Session Entrance {isPadEntry && <span className="text-indigo-600 text-sm ml-2">(Pad Mode)</span>}</h3>
               <p className="text-slate-400 text-sm">Please provide your credentials.</p>
             </div>
             <div className="space-y-4">
               <input 
                 type="text" 
                 placeholder="Full Student Name" 
-                className="w-full p-4 bg-slate-100 rounded-xl border-2 border-transparent outline-none transition-all text-slate-500 cursor-not-allowed" 
+                className="w-full p-4 bg-slate-50 rounded-xl border-2 border-transparent focus:border-indigo-500 outline-none transition-all font-bold text-slate-800" 
                 value={examEntry.name} 
-                readOnly
+                onChange={e => setExamEntry(v => ({...v, name: e.target.value}))}
+                onKeyDown={e => e.key === 'Enter' && startExam()}
               />
               <input 
                 type="text" 
@@ -968,13 +1153,11 @@ const App: React.FC = () => {
 
             {state.isRecording && !state.isPad && (
               <>
-                {/* Edge Glows */}
                 {edgeGlow.top && <div className="fixed top-0 left-0 right-0 h-24 bg-gradient-to-b from-rose-500/20 to-transparent pointer-events-none z-[60] animate-in fade-in duration-300" />}
                 {edgeGlow.bottom && <div className="fixed bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-rose-500/20 to-transparent pointer-events-none z-[60] animate-in fade-in duration-300" />}
                 {edgeGlow.left && <div className="fixed top-0 bottom-0 left-0 w-24 bg-gradient-to-r from-rose-500/20 to-transparent pointer-events-none z-[60] animate-in fade-in duration-300" />}
                 {edgeGlow.right && <div className="fixed top-0 bottom-0 right-0 w-24 bg-gradient-to-l from-rose-500/20 to-transparent pointer-events-none z-[60] animate-in fade-in duration-300" />}
                 
-                {/* Continuous Pulse Effect */}
                 <div 
                   className="fixed pointer-events-none z-[70] transition-transform duration-150 ease-out"
                   style={{ 
@@ -983,9 +1166,7 @@ const App: React.FC = () => {
                     transform: `translate(-50%, -50%) scale(${isMoving ? 0.7 : 1})`
                   }}
                 >
-                  {/* Outer Ring */}
                   <div className="absolute inset-0 w-12 h-12 -ml-6 -mt-6 rounded-full border-2 border-indigo-400/30 pulse-ring" />
-                  {/* Core Dot */}
                   <div className="w-2 h-2 rounded-full bg-indigo-500 pulse-core shadow-[0_0_8px_rgba(99,102,241,0.6)]" />
                 </div>
               </>
@@ -1075,7 +1256,7 @@ const App: React.FC = () => {
                    <p className="text-2xl font-black text-indigo-600">{dashboardStats.manual}</p>
                  </div>
                  <div className="text-center px-6">
-                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Locked/Violations</p>
+                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Offline/Locked</p>
                    <p className="text-2xl font-black text-rose-600">{dashboardStats.passive}</p>
                  </div>
                </div>
@@ -1089,11 +1270,12 @@ const App: React.FC = () => {
               {Object.keys(activeRoom.students).length === 0 ? (
                 <div className="col-span-full py-32 text-center text-slate-400 font-medium italic bg-white rounded-[2.5rem] border border-dashed border-slate-200">Waiting for students to join...</div>
               ) : (
-                // Fix: Explicitly cast Object.entries result to resolve unknown type issues in specific TS environments
                 (Object.entries(activeRoom.students) as [string, StudentInfo][]).map(([key, student]) => {
+                  const isOffline = isStudentOffline(student);
                   return (
                     <div key={key} className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm relative overflow-hidden group hover:shadow-lg transition-all flex flex-col">
                       <div className={`absolute top-0 right-0 w-2 h-full ${
+                        isOffline ? 'bg-slate-300 animate-pulse' :
                         student.status === StudentStatus.ACTIVE ? 'bg-emerald-500' : 
                         student.status === StudentStatus.VIOLATION ? 'bg-rose-600 animate-pulse' :
                         student.status === StudentStatus.SUBMITTED ? 'bg-indigo-500' :
@@ -1108,12 +1290,13 @@ const App: React.FC = () => {
                         </div>
                         <div className="text-right">
                           <span className={`text-[10px] font-black px-4 py-1.5 rounded-full uppercase tracking-widest ${
+                            isOffline ? 'bg-slate-100 text-slate-400' :
                             student.status === StudentStatus.ACTIVE ? 'bg-emerald-50 text-emerald-600' : 
                             student.status === StudentStatus.VIOLATION ? 'bg-rose-50 text-rose-600' :
                             student.status === StudentStatus.SUBMITTED ? 'bg-indigo-50 text-indigo-600' :
                             'bg-slate-100 text-slate-400'
                           }`}>
-                            {student.status === StudentStatus.ACTIVE ? 'LIVE' : student.status}
+                            {isOffline ? 'OFFLINE' : student.status === StudentStatus.ACTIVE ? 'LIVE' : student.status}
                           </span>
                           {student.lockReason && (
                             <p className="text-[9px] font-bold text-rose-500 mt-2 uppercase tracking-tighter">
@@ -1123,7 +1306,7 @@ const App: React.FC = () => {
                           <p className="text-[10px] text-slate-300 mt-3 font-mono">Last Seen: {new Date(student.lastSeen).toLocaleTimeString()}</p>
                         </div>
                       </div>
-                      { (student.status === StudentStatus.SUBMITTED || student.status === StudentStatus.VIOLATION) && (
+                      { (isOffline || student.status === StudentStatus.SUBMITTED || student.status === StudentStatus.VIOLATION || student.status === StudentStatus.PAUSED) && (
                         <button 
                           onClick={() => resetStudentStatus(key)}
                           className="mt-6 w-full py-3 bg-slate-900 text-white text-[10px] font-bold uppercase tracking-widest rounded-xl hover:bg-black transition-all shadow-lg shadow-slate-200"
@@ -1142,21 +1325,21 @@ const App: React.FC = () => {
         {view === 'LOCKED' && (
           <div className="max-w-md mx-auto py-24 text-center space-y-8 animate-in zoom-in-95">
              <div className={`w-24 h-24 ${lockType === 'SUBMISSION' ? 'bg-indigo-50' : 'bg-rose-50'} rounded-[2.5rem] flex items-center justify-center mx-auto shadow-2xl`}>
-               <svg className={`w-12 h-12 ${lockType === 'SUBMISSION' ? 'text-indigo-600' : 'text-rose-600'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-               </svg>
+                <svg className={`w-12 h-12 ${lockType === 'SUBMISSION' ? 'text-indigo-600' : 'text-rose-600'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                </svg>
              </div>
              <div>
-               <h2 className="text-4xl font-black text-slate-900 mb-4">
-                 {lockType === 'SUBMISSION' ? 'Submitted' : lockType === 'VIOLATION' ? 'Account Locked' : 'Session Ended'}
-               </h2>
-               <p className="text-slate-500 leading-relaxed font-medium">
-                 {lockType === 'SUBMISSION' 
-                   ? 'Your exam is complete. Your content has been securely saved and downloaded.' 
-                   : lockType === 'VIOLATION'
-                   ? 'The session was locked due to an environment violation. Your current draft was saved, but further editing is disabled.'
-                   : 'The teacher has ended the session. Your work has been automatically downloaded.'}
-               </p>
+                <h2 className="text-4xl font-black text-slate-900 mb-4">
+                  {lockType === 'SUBMISSION' ? 'Submitted' : lockType === 'VIOLATION' ? 'Account Locked' : 'Session Ended'}
+                </h2>
+                <p className="text-slate-500 leading-relaxed font-medium">
+                  {lockType === 'SUBMISSION' 
+                    ? 'Your exam is complete. Your content has been securely saved and downloaded.' 
+                    : lockType === 'VIOLATION'
+                    ? 'The session was locked due to an environment violation. Your current draft was saved, but further editing is disabled.'
+                    : 'The teacher has ended the session. Your work has been automatically downloaded.'}
+                </p>
              </div>
              <button onClick={() => setView('HOME')} className="w-full py-5 bg-slate-900 text-white rounded-2xl font-black transition-all hover:bg-black shadow-xl">Return to Portal</button>
           </div>
